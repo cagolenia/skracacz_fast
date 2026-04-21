@@ -1,0 +1,134 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database - dla metadanych linków
+  postgres:
+    image: postgres:15-alpine
+    container_name: url_shortener_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-url_shortener}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - url_shortener_network
+
+  # Redis - cache i broker dla szybkich przekierowań
+  redis:
+    image: redis:7-alpine
+    container_name: url_shortener_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - url_shortener_network
+
+  # RabbitMQ - kolejka komunikatów dla analityki
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: url_shortener_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "5672:5672"   # AMQP port
+      - "15672:15672" # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - url_shortener_network
+
+  # Link Management Service - zarządzanie linkami (CRUD)
+  link_management:
+    build:
+      context: ./services/link_management
+      dockerfile: Dockerfile
+    container_name: url_shortener_link_management
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres123}@postgres:5432/${POSTGRES_DB:-url_shortener}
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: ${DEBUG:-True}
+    ports:
+      - "${LINK_MANAGEMENT_PORT:-8001}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - url_shortener_network
+    restart: unless-stopped
+
+  # Redirection Service - szybkie przekierowania
+  redirection:
+    build:
+      context: ./services/redirection
+      dockerfile: Dockerfile
+    container_name: url_shortener_redirection
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LINK_MANAGEMENT_URL: http://link_management:8000
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      DEBUG: ${DEBUG:-True}
+    ports:
+      - "${REDIRECTION_PORT:-8002}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      link_management:
+        condition: service_started
+    networks:
+      - url_shortener_network
+    restart: unless-stopped
+
+  # Analytics Service - statystyki i analityka
+  analytics:
+    build:
+      context: ./services/analytics
+      dockerfile: Dockerfile
+    container_name: url_shortener_analytics
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres123}@postgres:5432/${POSTGRES_DB:-url_shortener}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      DEBUG: ${DEBUG:-True}
+    ports:
+      - "${ANALYTICS_PORT:-8003}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - url_shortener_network
+    restart: unless-stopped
+
+networks:
+  url_shortener_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
